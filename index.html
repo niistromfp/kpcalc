@@ -4502,27 +4502,29 @@ function gdriveInit() {
         scope: GDRIVE_SCOPE,
         callback: gdriveOnTokenResponse,
         error_callback: function(e) {
-          // Тихая переавторизация может молча упасть, если у пользователя истёк
-          // или отозван сеанс Google в браузере. Это нормально — переводим в idle,
-          // чтобы пользователь мог нажать «Войти через Google» вручную.
-          var et = e && e.type;
-          if (et === 'popup_closed' || et === 'popup_failed_to_open') {
-            gdriveSetState('idle');
-          } else if (GDRIVE.state === 'signing-in' && !GDRIVE.accessToken) {
-            // silent attempt failed → idle
+          // Тихая переавторизация (prompt: 'none') может молча упасть с error.type ===
+          // 'interaction_required' / 'login_required' / 'consent_required' и т.п. —
+          // это нормально и означает «надо чтоб пользователь нажал Войти». Переводим
+          // в idle. Также idle при popup_closed/popup_failed_to_open.
+          var et = (e && e.type) || '';
+          var silentFailTypes = ['interaction_required','login_required','consent_required',
+                                 'account_selection_required','immediate_failed',
+                                 'popup_closed','popup_failed_to_open'];
+          if (silentFailTypes.indexOf(et) >= 0 || (GDRIVE.state === 'signing-in' && !GDRIVE.accessToken)) {
             gdriveSetState('idle');
           } else {
             gdriveSetState('error', 'Ошибка авторизации: ' + (et || 'неизвестная'));
           }
         }
       });
-      // Silent re-auth: пытаемся получить токен без попапа, если пользователь уже
-      // авторизовывался раньше (есть email или флаг connected). Если в Google-сессии
-      // браузера юзер ещё залогинен и согласие уже выдано — токен прилетит мгновенно.
+      // Silent re-auth: ЖЁСТКО тихий запрос токена (prompt: 'none') — без попапа.
+      // Если у Google в браузере ещё активна сессия пользователя и согласие выдано —
+      // токен прилетит без UI. Иначе error_callback переведёт в idle, и пользователь
+      // нажмёт «Войти через Google» сам.
       if (S.gdrive.email || S.gdrive.connected) {
         gdriveSetState('signing-in');
         var hint = S.gdrive.email || undefined;
-        GDRIVE.tokenClient.requestAccessToken(hint ? { prompt: '', hint: hint } : { prompt: '' });
+        GDRIVE.tokenClient.requestAccessToken(hint ? { prompt: 'none', hint: hint } : { prompt: 'none' });
       } else {
         gdriveSetState('idle');
       }
@@ -4596,9 +4598,10 @@ function gdriveFetchEmail(cb) {
 
 function gdriveCheckAuth() {
   if (!GDRIVE.accessToken || Date.now() >= GDRIVE.tokenExpiry) {
-    // Token expired — silent re-auth
-    if (GDRIVE.tokenClient && S.gdrive.email) {
-      GDRIVE.tokenClient.requestAccessToken({ prompt: '', hint: S.gdrive.email });
+    // Токен истёк — пробуем тихо обновить без попапа
+    if (GDRIVE.tokenClient && (S.gdrive.email || S.gdrive.connected)) {
+      var hint = S.gdrive.email || undefined;
+      GDRIVE.tokenClient.requestAccessToken(hint ? { prompt: 'none', hint: hint } : { prompt: 'none' });
     }
     return false;
   }
