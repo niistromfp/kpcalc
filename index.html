@@ -504,6 +504,7 @@ td.tot { text-align: right; font-variant-numeric: tabular-nums; font-weight: 600
     </div>
     <table>
       <thead><tr>
+        <th style="text-align:center;width:30px" title="Статус облачной синхронизации">☁</th>
         <th>Дата сохр.</th><th>Юр.лицо</th><th>Исх. №</th><th>Заказчик</th>
         <th class="n">Позиций</th><th class="n">Сумма с НДС</th><th class="n">Прибыль</th><th class="n">Рентаб.</th>
         <th>Действия</th>
@@ -956,7 +957,7 @@ var S = {
   history: [],
   projects: {},
   // Параметры синхронизации с Google Drive. clientId пустой = фича выключена.
-  gdrive: { clientId: '', email: '', fileId: '', lastSync: 0, autosync: true }
+  gdrive: { clientId: '', email: '', fileId: '', lastSync: 0, autosync: true, connected: false }
 };
 
 function $(s) { return document.querySelector(s); }
@@ -2499,12 +2500,31 @@ function renderHistory() {
     return;
   }
   if (empty) empty.style.display = 'none';
+  // Готовим контекст для значка синхронизации:
+  //   - подключён ли пользователь к Google Drive вообще
+  //   - время последнего успешного push (S.gdrive.lastSync, мс)
+  //   - запись считается синхронизированной, если её savedAt <= lastSync
+  var syncOn = !!(S.gdrive && (S.gdrive.connected || S.gdrive.email));
+  var lastSyncTs = (S.gdrive && Number(S.gdrive.lastSync)) || 0;
   for (var i = 0; i < S.history.length; i++) {
     var r = S.history[i];
     var entShort = (r.entity === 'oz') ? 'ОЗ' : 'СВ';
     var profitColor = r.profit >= 0 ? '#3a7a2a' : '#b91c1c';
+    // Значок: ✓ зелёный (синхронизировано), ↻ серый (ещё не отправлено), · (синк выключен)
+    var syncBadge;
+    if (!syncOn) {
+      syncBadge = '<span style="color:#ccc;font-size:11px" title="Облачная синхронизация не настроена">·</span>';
+    } else {
+      var recTs = Date.parse(r.savedAt) || 0;
+      if (lastSyncTs >= recTs) {
+        syncBadge = '<span style="color:#3a7a2a;font-size:12px;font-weight:700" title="Запись синхронизирована с Google Drive">☁✓</span>';
+      } else {
+        syncBadge = '<span style="color:#a06800;font-size:12px" title="Ожидает отправки в Google Drive">☁↻</span>';
+      }
+    }
     var tr = document.createElement('tr');
     tr.innerHTML =
+      '<td style="text-align:center;width:30px">'+syncBadge+'</td>' +
       '<td style="font-size:11px;color:#888">'+fmtSavedAt(r.savedAt)+'</td>' +
       '<td><span style="font-weight:600">'+entShort+'</span></td>' +
       '<td>'+r.num+'</td>' +
@@ -4223,7 +4243,7 @@ function loadLocal() {
       if (d.projects && typeof d.projects === 'object') S.projects = d.projects;
       if (d.gdrive && typeof d.gdrive === 'object') {
         // Merge поверх дефолта, чтобы новые поля появлялись у старых сохранений
-        S.gdrive = Object.assign({ clientId:'', email:'', fileId:'', lastSync:0, autosync:true }, d.gdrive);
+        S.gdrive = Object.assign({ clientId:'', email:'', fileId:'', lastSync:0, autosync:true, connected:false }, d.gdrive);
       }
     }
     // Migration: add any default catalog items that don't exist yet (so users upgrading get new sizes)
@@ -4431,7 +4451,7 @@ var GDRIVE = {
   gisLoaded: false
 };
 
-var GDRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.appdata';
+var GDRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.appdata https://www.googleapis.com/auth/userinfo.email';
 var GDRIVE_FILE_NAME = 'kpcalc-backup.json';
 
 function gdriveIsHosted() {
@@ -4482,13 +4502,27 @@ function gdriveInit() {
         scope: GDRIVE_SCOPE,
         callback: gdriveOnTokenResponse,
         error_callback: function(e) {
-          gdriveSetState('error', 'Ошибка авторизации: ' + (e && e.type ? e.type : 'неизвестная'));
+          // Тихая переавторизация может молча упасть, если у пользователя истёк
+          // или отозван сеанс Google в браузере. Это нормально — переводим в idle,
+          // чтобы пользователь мог нажать «Войти через Google» вручную.
+          var et = e && e.type;
+          if (et === 'popup_closed' || et === 'popup_failed_to_open') {
+            gdriveSetState('idle');
+          } else if (GDRIVE.state === 'signing-in' && !GDRIVE.accessToken) {
+            // silent attempt failed → idle
+            gdriveSetState('idle');
+          } else {
+            gdriveSetState('error', 'Ошибка авторизации: ' + (et || 'неизвестная'));
+          }
         }
       });
-      // Silent re-auth: если уже логинились — попробуем без попапа
-      if (S.gdrive.email) {
+      // Silent re-auth: пытаемся получить токен без попапа, если пользователь уже
+      // авторизовывался раньше (есть email или флаг connected). Если в Google-сессии
+      // браузера юзер ещё залогинен и согласие уже выдано — токен прилетит мгновенно.
+      if (S.gdrive.email || S.gdrive.connected) {
         gdriveSetState('signing-in');
-        GDRIVE.tokenClient.requestAccessToken({ prompt: '', hint: S.gdrive.email });
+        var hint = S.gdrive.email || undefined;
+        GDRIVE.tokenClient.requestAccessToken(hint ? { prompt: '', hint: hint } : { prompt: '' });
       } else {
         gdriveSetState('idle');
       }
@@ -4515,6 +4549,7 @@ function gdriveSignOut() {
   S.gdrive.email = '';
   S.gdrive.fileId = '';
   S.gdrive.lastSync = 0;
+  S.gdrive.connected = false;
   try { localStorage.setItem('kpcalc', JSON.stringify(Object.assign({}, JSON.parse(localStorage.getItem('kpcalc')||'{}'), { gdrive: S.gdrive }))); } catch(e) {}
   gdriveSetState('idle');
 }
@@ -4526,10 +4561,9 @@ function gdriveOnTokenResponse(resp) {
   }
   GDRIVE.accessToken = resp.access_token;
   GDRIVE.tokenExpiry = Date.now() + (Number(resp.expires_in) || 3600) * 1000 - 60 * 1000;
-  // Узнаём email текущего пользователя через People API не нужен — берём из id_token? 
-  // У GIS токен-флоу нет id_token. Альтернатива — userinfo endpoint, но он требует scope profile.
-  // Для нашей задачи достаточно знать что аутентифицирован — email возьмём из тестовой запроса userinfo,
-  // или будем хранить плейсхолдер «authorized». Здесь делаем простой userinfo запрос (scope не требуется).
+  // Помечаем "уже подключались" — даже если fetchEmail ниже не сработает,
+  // при следующем открытии страницы попытаемся тихо переавторизоваться.
+  S.gdrive.connected = true;
   gdriveFetchEmail(function() {
     gdriveSetState('signed-in');
     saveLocal();
@@ -4777,6 +4811,8 @@ function gdrivePush(cb) {
     }
     S.gdrive.lastSync = payload._meta.savedAt;
     gdriveSetState('signed-in');
+    // После успешной отправки — обновим значки синхронизации в истории, если она открыта
+    if (typeof renderHistory === 'function') renderHistory();
     cb(null);
   });
 }
